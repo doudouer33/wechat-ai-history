@@ -8,6 +8,7 @@
   recent [-d D -n N]          最近动态
   summary [-d D]              结构化摘要(待办分析)
   events [-e EVENT -d D -n N] 系统事件（拍一拍/撤回/群事件等）
+  changes [--cursor CURSOR] [-n N] 按表 local_id 读取新增消息
 
 用法: python query.py <子命令> [参数] [--json]
 """
@@ -16,6 +17,9 @@ import os
 import time
 import json
 import argparse
+import hashlib
+import heapq
+from pathlib import Path
 from contextlib import closing
 from datetime import datetime
 
@@ -26,6 +30,9 @@ import contacts  # noqa: E402
 import db  # noqa: E402
 import message  # noqa: E402
 import xmlmsg  # noqa: E402
+import accounts  # noqa: E402
+import incremental_cursor  # noqa: E402
+import native_reader  # noqa: E402
 
 
 def _msg_dbs_tables():
@@ -77,6 +84,110 @@ def _search_identity(db_path: str, row: dict) -> tuple:
         row.get("server_id"),
         row.get("create_time"),
     )
+
+
+def _source_identity(path: Path):
+    stat = path.stat()
+    with path.open('rb') as handle:
+        salt = handle.read(accounts.SALT_SIZE)
+    if len(salt) != accounts.SALT_SIZE:
+        raise incremental_cursor.CursorError('Source database header is truncated')
+    return (stat.st_dev, stat.st_ino, salt), hashlib.sha256(b'wechat-generation-v1\0' + salt).hexdigest()
+
+
+@contacts.query_snapshot
+def read_new_messages(cursor: str | None = None, limit: int = 200) -> dict:
+    """Read appended positive local_ids, with caller-owned at-least-once cursors.
+
+    Initialization captures current per-table maxima and returns no history.
+    Updates/deletes and inserts at or below a watermark are outside this API.
+    Each shard uses one short snapshot; there is no cross-shard atomic snapshot.
+    """
+    if type(limit) is not int or not 1 <= limit <= 2000:
+        raise ValueError('limit must be an integer between 1 and 2000')
+    previous = incremental_cursor.decode(cursor) if cursor is not None else None
+    if config.DB_BACKEND != 'sqlcipher_native':
+        raise ValueError('changes requires the sqlcipher_native live database backend')
+    storage = Path(db.find_data_dir()).resolve()
+    account = hashlib.sha256(
+        b'wechat-account-v1\0' + accounts.account_name(str(storage)).lower().encode('utf-8')
+    ).hexdigest()
+    if previous is not None and previous['account'] != account:
+        raise incremental_cursor.CursorError('Cursor account does not match the selected account')
+    paths = {Path(path).resolve().relative_to(storage).as_posix(): Path(path).resolve()
+             for path in db.get_message_dbs()}
+    old_databases = previous['databases'] if previous is not None else {}
+    if old_databases.keys() - paths.keys():
+        raise incremental_cursor.CursorError('A cursor database is missing; explicit recovery is required')
+    state = {'version': incremental_cursor.VERSION, 'account': account, 'databases': {}}
+    candidates = []
+    identities = {}
+    cap = limit + 1
+    def selection_key(row):
+        return row['local_id'], row['source_db'], row['source_table']
+    for source, path in sorted(paths.items()):
+        identity, generation = _source_identity(path)
+        identities[source] = identity
+        old = old_databases.get(source)
+        if old is not None and generation != old['generation']:
+            raise incremental_cursor.CursorError('Database generation changed; cursor cannot be resumed')
+        marks = dict(old['tables']) if old is not None else {}
+        state['databases'][source] = {'generation': generation, 'tables': marks}
+        with native_reader.connection(str(path)) as con:
+            con.execute('BEGIN')
+            tables = [row['name'] for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND substr(name, 1, 4)='Msg_' ORDER BY name")]
+            if marks.keys() - set(tables):
+                raise incremental_cursor.CursorError('A cursor message table is missing')
+            names = None
+            for table in tables:
+                if not incremental_cursor._TABLE.fullmatch(table):
+                    raise incremental_cursor.CursorError('Unsupported message table name')
+                quoted = _quoted_identifier(table)
+                columns = list(con.execute(f'PRAGMA table_info({quoted})'))
+                primary = [column for column in columns if column['pk']]
+                if (len(primary) != 1 or primary[0]['name'] != 'local_id'
+                        or primary[0]['type'].upper() != 'INTEGER'):
+                    raise incremental_cursor.CursorError('Messages require a unique INTEGER PRIMARY KEY local_id')
+                first = con.execute(f'SELECT local_id FROM {quoted} ORDER BY local_id ASC LIMIT 1').fetchone()
+                last = con.execute(f'SELECT local_id FROM {quoted} ORDER BY local_id DESC LIMIT 1').fetchone()
+                maximum = last[0] if last is not None else 0
+                if first is not None and first[0] <= 0:
+                    raise incremental_cursor.CursorError('Message local_id must be positive')
+                if previous is None:
+                    marks[table] = maximum
+                    continue
+                mark = marks.setdefault(table, 0)
+                if maximum < mark:
+                    raise incremental_cursor.CursorError('Message local_id maximum regressed; cursor cannot be resumed')
+                rows = con.execute(
+                    f'SELECT m.local_id, m.server_id, m.create_time, m.local_type, m.real_sender_id, '
+                    f'm.message_content AS message_body, n.user_name AS sender_wxid '
+                    f'FROM {quoted} m LEFT JOIN Name2Id n ON n.rowid=m.real_sender_id '
+                    'WHERE m.local_id > ? ORDER BY m.local_id ASC LIMIT ?', (mark, cap)
+                ).fetchall()
+                if rows and names is None:
+                    names = {f'Msg_{hashlib.md5(row[0].encode()).hexdigest()}': row[0]
+                             for row in con.execute('SELECT user_name FROM Name2Id') if row[0]}
+                batch = [dict(row, source_db=source, source_table=table,
+                              contact_wxid=(names or {}).get(table, table)) for row in rows]
+                # Selection preserves a prefix of every table's ID order.
+                # Lookahead rows discarded here must never advance a watermark.
+                candidates = heapq.nsmallest(cap, candidates + batch, key=selection_key)
+    selected = candidates[:limit]
+    messages = []
+    for row in selected:
+        formatted = _fmt_msg(row)
+        formatted.update({key: row[key] for key in ('source_db', 'source_table', 'local_id', 'server_id')})
+        formatted['contact'] = contacts.resolve_contact_name(row['contact_wxid'])
+        messages.append(formatted)
+        state['databases'][row['source_db']]['tables'][row['source_table']] = row['local_id']
+    for source, path in paths.items():
+        if _source_identity(path)[0] != identities[source]:
+            raise incremental_cursor.CursorError('Source database changed during the query; retry the same cursor')
+    messages.sort(key=lambda item: (item['_ts'], item['source_db'], item['source_table'], item['local_id']))
+    return {'messages': messages, 'count': len(messages), 'has_more': len(candidates) > limit,
+            'next_cursor': incremental_cursor.encode(state)}
 
 
 @contacts.query_snapshot
@@ -662,6 +773,7 @@ def main():
     base.add_argument("--json", action="store_true", help="结构化 JSON 输出")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("list", parents=[base]); p.add_argument('-n', '--limit', type=int); p.add_argument('--offset', type=int, default=0)
+    p = sub.add_parser('changes', parents=[base]); p.add_argument('--cursor'); p.add_argument('-n', '--limit', type=int, default=200)
     p = sub.add_parser("read", parents=[base]); p.add_argument("contact"); p.add_argument("-n", "--limit", type=int, default=50); p.add_argument("-d", "--days", type=int, default=7)
     p = sub.add_parser("search", parents=[base]); p.add_argument("keyword"); p.add_argument("-d", "--days", type=int, default=30); p.add_argument("-n", "--limit", type=int, default=50)
     p = sub.add_parser("recent", parents=[base]); p.add_argument("-d", "--days", type=int, default=3); p.add_argument("-n", "--limit", type=int, default=100)
@@ -677,6 +789,8 @@ def main():
             a.cmd = 'list-page'
         else:
             r = list_chats()
+    elif a.cmd == 'changes':
+        r = read_new_messages(a.cursor, a.limit)
     elif a.cmd == "read":
         r = read_chat(a.contact, a.limit, a.days)
     elif a.cmd == "search":

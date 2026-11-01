@@ -25,6 +25,15 @@ mcp = FastMCP(
 
 
 @mcp.tool()
+def wechat_read_new_messages(cursor: str | None = None, limit: int = 200) -> dict:
+    """读取新写入消息。首次不传 cursor 只建立基线；成功处理本批后保存 next_cursor。
+
+    has_more 为真时继续分页。按表 local_id 增量，至少一次交付；不捕获旧行更新/删除。
+    """
+    return query.read_new_messages(cursor, limit)
+
+
+@mcp.tool()
 def wechat_list_accounts() -> str:
     """列出本机已解密的微信账号（目录名 + wxid）。多账号时用 WECHAT_ACCOUNT 指定要读哪个。"""
     import config

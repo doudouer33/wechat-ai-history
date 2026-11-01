@@ -51,7 +51,8 @@ def t_platform():
 
 # ── 2. key 文件 ──
 def t_key():
-    kf = os.path.join(SKILL, "key.txt" if IS_MAC else "key_windows.txt")
+    import config
+    kf = config.KEY_FILE
     return os.path.exists(kf), os.path.basename(kf) + (" 存在" if os.path.exists(kf) else " 缺失")
 
 

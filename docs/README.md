@@ -20,6 +20,7 @@
 | [phase1-validation-report.md](phase1-validation-report.md) | 增量同步 Phase 1 的真实环境验证、全量解密与查询基准，以及验收限制 |
 | [phase2-1-technical-analysis.md](phase2-1-technical-analysis.md) | SQLCipher 直读与 WAL 增量解密的实验证据、路线选择、实现计划和待验收项目 |
 | [phase2-2-implementation.md](phase2-2-implementation.md) | Windows SQLCipher 直读后端、查询兼容、自动化测试与使用方式 |
+| [incremental-reading-api.md](incremental-reading-api.md) | local_id 增量 API、Cursor、CLI/MCP、分页和恢复语义及可靠性边界 |
 | [chat-list-pagination.md](chat-list-pagination.md) | 会话列表分页的坑 |
 | [media-manifest-proposal.md](media-manifest-proposal.md) | 富媒体导出清单的设计提案 |
 | [pull-request-archive.md](pull-request-archive.md) | 两个已合并 PR 的内容存档（XML 解析 + 搜索性能、账号无关化） |
