@@ -5,6 +5,7 @@
 |---|---|
 | `test_e2e.py` | 端到端测试（双端 platform 自动分派，含系统事件与 JSON 输出） |
 | `check_consistency.py` | 开发仓与一个已安装运行单元的一致性校验；跨 wecom 检查按需启用 |
+| `phase2_1_sqlcipher_probe.py` | Phase 2.1 的纯合成 SQLCipher 只读/WAL 可行性实验，不访问微信或实现增量同步；可选依赖与命令见 [技术报告](../docs/phase2-1-technical-analysis.md) |
 
 > 另有单元测试(pytest, **无需真实数据**)在 `tests/`(langlobal):`python3 -m pytest tests/ -v`
 
