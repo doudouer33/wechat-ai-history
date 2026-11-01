@@ -26,3 +26,19 @@ sha512_rvas_all.json
 *导出*.txt
 candidates.txt
 ctx_candidates.txt
+
+# Local validation artifacts, database companions and plaintext snapshots
+.local/
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.*
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.part
