@@ -45,7 +45,7 @@ def q(sub, *args, timeout=180):
 # ── 1. 平台 + 后端分派 ──
 def t_platform():
     import config
-    exp = "sqlcipher" if IS_MAC else "sqlite3"
+    exp = "sqlcipher" if IS_MAC else os.environ.get('WECHAT_DB_BACKEND', 'sqlcipher_native')
     return config.DB_BACKEND == exp, f"{platform.system()} / backend={config.DB_BACKEND}"
 
 

@@ -23,10 +23,13 @@ if IS_MACOS:
         "xwechat_files/*/db_storage"
     )
 elif IS_WINDOWS:
-    DB_BACKEND = "sqlite3"
+    KEY_FILE = os.path.join(SKILL_DIR, 'key_windows.txt')
+    DB_BACKEND = os.environ.get('WECHAT_DB_BACKEND', 'sqlcipher_native')
+    if DB_BACKEND not in ('sqlcipher_native', 'sqlite3'):
+        raise ValueError('WECHAT_DB_BACKEND must be sqlcipher_native or sqlite3 on Windows')
     # decrypt_all.py 解密产物根目录（明文库，保留 {wxid}/db_storage 结构）
     DECRYPTED_DIR = os.path.join(SKILL_DIR, "decrypted")
-    # 原始加密库（仅供提 key/解密时定位源）
+    # 原始加密库（在线查询及提 key/全量解密的来源）
     WECHAT_DATA_GLOB = os.path.expanduser(
         "~/Documents/xwechat_files/*/db_storage"
     )

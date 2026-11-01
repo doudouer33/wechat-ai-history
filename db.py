@@ -12,6 +12,7 @@ import subprocess
 import config
 import crypto
 import accounts
+import native_reader
 
 
 def get_account_files_dir() -> str:
@@ -73,6 +74,9 @@ def iter_query(db_path: str, sql: str, batch_size: int = 500):
     """Stream SQLite rows from one read-only cursor; always close on early exit."""
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError('batch_size must be a positive integer')
+    if config.DB_BACKEND == 'sqlcipher_native':
+        yield from native_reader.iter_query(db_path, sql, batch_size)
+        return
     if config.DB_BACKEND != 'sqlite3':
         raise ValueError('iter_query requires the sqlite3 backend')
     uri = Path(db_path).resolve().as_uri() + '?mode=ro'
@@ -122,6 +126,13 @@ def preamble(key: str, db_path: str | None = None) -> str:
 
 def test_key(key: str, db_path: str) -> bool:
     """Test if a database is readable (sqlcipher: key works / sqlite3: plaintext opens)."""
+    if config.DB_BACKEND == 'sqlcipher_native':
+        driver = native_reader._driver()
+        try:
+            native_reader.query(db_path, 'SELECT count(*) FROM sqlite_master', key)
+            return True
+        except (OSError, ValueError, driver.DatabaseError):
+            return False
     if config.DB_BACKEND == "sqlite3":
         try:
             _exec_sqlite3(db_path, "SELECT count(*) FROM sqlite_master;")
@@ -142,6 +153,8 @@ def test_key(key: str, db_path: str) -> bool:
 
 def query(db_path: str, sql: str) -> list[dict]:
     """Execute SQL query and return list of dicts."""
+    if config.DB_BACKEND == 'sqlcipher_native':
+        return native_reader.query(db_path, sql)
     if config.DB_BACKEND == "sqlite3":
         return [dict(r) for r in _exec_sqlite3(db_path, sql)]
     key = crypto.load_key()
@@ -159,6 +172,10 @@ def query(db_path: str, sql: str) -> list[dict]:
 
 def query_raw(db_path: str, sql: str) -> list[str]:
     """Execute SQL and return raw output lines."""
+    if config.DB_BACKEND == 'sqlcipher_native':
+        with native_reader.connection(db_path) as con:
+            return ['|'.join('' if c is None else str(c) for c in row)
+                    for row in con.execute(sql).fetchall()]
     if config.DB_BACKEND == "sqlite3":
         rows = _exec_sqlite3(db_path, sql)
         return ["|".join("" if c is None else str(c) for c in tuple(r)) for r in rows]
@@ -183,20 +200,25 @@ def get_my_wxid() -> str:
     return accounts.account_wxid(data_dir)
 
 
-_data_dir_cache: tuple[tuple[str, str], str] | None = None
+_data_dir_cache: tuple[tuple[str, ...], str] | None = None
 
 
-def _data_dir_signature() -> tuple[str, str]:
+def _data_dir_signature() -> tuple[str, ...]:
     root = (
         config.DECRYPTED_DIR
         if config.DB_BACKEND == "sqlite3"
         else config.WECHAT_DATA_GLOB
     )
+    if config.DB_BACKEND == 'sqlcipher_native':
+        return (config.DB_BACKEND, root, accounts.selected_account(),
+                hashlib.sha256(crypto.load_key().encode()).hexdigest())
     return config.DB_BACKEND, root
 
 
 def _message_db_candidates(data_dir: str) -> list[str]:
-    return sorted(glob.glob(os.path.join(data_dir, "message", "message_[0-9].db")))
+    return sorted(path for path in glob.glob(os.path.join(data_dir, 'message', 'message_*.db'))
+                  if Path(path).stem.removeprefix('message_').isascii()
+                  and Path(path).stem.removeprefix('message_').isdigit())
 
 
 def find_data_dir() -> str:
@@ -207,6 +229,8 @@ def find_data_dir() -> str:
         cached_signature, cached_path = _data_dir_cache
         if cached_signature == signature and os.path.isdir(cached_path):
             return cached_path
+        if cached_signature == signature and config.DB_BACKEND == 'sqlcipher_native':
+            raise FileNotFoundError('Selected source account is unavailable; refusing to switch accounts')
     if config.DB_BACKEND == "sqlite3":
         path = _find_decrypted_data_dir()
         _data_dir_cache = signature, path
@@ -215,6 +239,16 @@ def find_data_dir() -> str:
     if not matches:
         raise FileNotFoundError(f"未找到 WeChat 数据目录: {config.WECHAT_DATA_GLOB}")
     key = crypto.load_key()
+    if config.DB_BACKEND == 'sqlcipher_native':
+        wanted = accounts.selected_account().lower()
+        if wanted:
+            matches = [p for p in matches if wanted in accounts.account_name(p).lower()]
+        valid = [p for p in matches
+                 if any(test_key(key, shard) for shard in _message_db_candidates(p))]
+        if len(valid) != 1:
+            raise RuntimeError('Source account could not be uniquely verified; check WECHAT_ACCOUNT, key and source availability')
+        _data_dir_cache = signature, valid[0]
+        return valid[0]
     for match in matches:
         if any(test_key(key, msg_db) for msg_db in _message_db_candidates(match)):
             _data_dir_cache = signature, match
@@ -256,9 +290,18 @@ _message_dbs_cache: tuple[str, list[str]] | None = None
 
 
 def get_message_dbs() -> list[str]:
-    """Get paths to all message database files that our key can access. Cached per process."""
+    """Get readable message shards; live native sources are rediscovered each call."""
     global _message_dbs_cache
     data_dir = find_data_dir()
+    if config.DB_BACKEND == 'sqlcipher_native':
+        # Discover each time, including multi-digit shards. Never publish a
+        # partial result when a discovered source fails validation.
+        dbs = _message_db_candidates(data_dir)
+        if not dbs:
+            raise FileNotFoundError('No message shards in the selected source account')
+        for path in dbs:
+            query(path, 'SELECT count(*) FROM sqlite_master')
+        return dbs
     if _message_dbs_cache is not None:
         cached_dir, cached_dbs = _message_dbs_cache
         if cached_dir == data_dir and all(os.path.isfile(path) for path in cached_dbs):
@@ -286,6 +329,8 @@ def get_name2id() -> dict[str, str]:
         try:
             rows = query(dbp, "SELECT user_name FROM Name2Id;")
         except Exception:
+            if config.DB_BACKEND == 'sqlcipher_native':
+                raise
             continue
         for row in rows:
             un = row.get("user_name", "")

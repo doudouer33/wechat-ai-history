@@ -1,11 +1,28 @@
 """Contact name resolution — merges contact.db (auto) with contacts.json (override)."""
 import json
 import os
+from contextvars import ContextVar
+from functools import wraps
 
 import config
 import db
 
 _merged_cache: dict[str, dict] | None = None
+_query_contacts = ContextVar('query_contacts', default=None)
+
+
+def query_snapshot(function):
+    """Reuse contacts within one request, then discard the live snapshot."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        if config.DB_BACKEND != 'sqlcipher_native' or _query_contacts.get() is not None:
+            return function(*args, **kwargs)
+        token = _query_contacts.set([None])
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _query_contacts.reset(token)
+    return wrapped
 
 
 def _build_merged() -> dict[str, dict]:
@@ -16,7 +33,10 @@ def _build_merged() -> dict[str, dict]:
     - alias comes from contact.db (the current 微信号)
     """
     global _merged_cache
-    if _merged_cache is not None:
+    scope = _query_contacts.get() if config.DB_BACKEND == 'sqlcipher_native' else None
+    if scope is not None and scope[0] is not None:
+        return scope[0]
+    if _merged_cache is not None and config.DB_BACKEND != 'sqlcipher_native':
         return _merged_cache
 
     # Base layer: contact.db
@@ -24,6 +44,8 @@ def _build_merged() -> dict[str, dict]:
     try:
         merged = db.load_contacts_from_db()
     except FileNotFoundError:
+        if config.DB_BACKEND == 'sqlcipher_native':
+            raise
         pass
 
     # Override layer: contacts.json
@@ -43,14 +65,21 @@ def _build_merged() -> dict[str, dict]:
         except (json.JSONDecodeError, OSError):
             pass
 
-    _merged_cache = merged
+    if config.DB_BACKEND == 'sqlcipher_native':
+        if scope is not None:
+            scope[0] = merged
+    else:
+        _merged_cache = merged
     return merged
 
 
 def invalidate_cache():
-    """Clear the merged cache (call after editing contacts.json)."""
+    """Clear the offline merged cache (live snapshots last only one request)."""
     global _merged_cache
     _merged_cache = None
+    scope = _query_contacts.get()
+    if scope is not None:
+        scope[0] = None
 
 
 def resolve_contact_name(wxid: str) -> str:

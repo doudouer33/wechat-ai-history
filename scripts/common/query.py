@@ -16,6 +16,7 @@ import os
 import time
 import json
 import argparse
+from contextlib import closing
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # skill 根
@@ -44,7 +45,7 @@ def _chunks(values: list[str], size: int = 200):
 
 def _iter_query_pages(db_path: str, selects: list[str], page_size: int = 500):
     union = " UNION ALL ".join(selects)
-    if config.DB_BACKEND == 'sqlite3':
+    if config.DB_BACKEND in ('sqlite3', 'sqlcipher_native'):
         # One sort/scan, with bounded Python batches, instead of repeating the
         # entire UNION and discarding an increasing OFFSET for each page.
         yield from db.iter_query(
@@ -78,6 +79,7 @@ def _search_identity(db_path: str, row: dict) -> tuple:
     )
 
 
+@contacts.query_snapshot
 def list_chats() -> list[dict]:
     name2id = db.get_name2id()
     return [{"wxid": wxid, "display": contacts.resolve_contact_name(wxid)}
@@ -91,6 +93,7 @@ def _validate_window(days: int, limit: int | None = None):
         raise ValueError('limit must be an integer between 1 and 2000')
 
 
+@contacts.query_snapshot
 def list_chat_page(limit: int = 100, offset: int = 0) -> dict:
     """Return a bounded page with a continuation offset."""
     if type(limit) is not int or not 1 <= limit <= 2000:
@@ -105,6 +108,7 @@ def list_chat_page(limit: int = 100, offset: int = 0) -> dict:
             'next_offset': following if following < len(chats) else None}
 
 
+@contacts.query_snapshot
 def read_chat(contact: str, limit: int = 50, days: int = 7) -> dict:
     _validate_window(days, limit)
     name2id = db.get_name2id()
@@ -135,6 +139,7 @@ def read_chat(contact: str, limit: int = 50, days: int = 7) -> dict:
     return {"chats": out}
 
 
+@contacts.query_snapshot
 def search(keyword: str, days: int = 30, limit: int = 50) -> dict:
     _validate_window(days, limit)
     name2id = db.get_name2id()
@@ -203,27 +208,29 @@ def search(keyword: str, days: int = 30, limit: int = 50) -> dict:
                 append_if_match(db_path, row)
 
             fallback_matches = 0
-            for row in _iter_query_pages(db_path, fallback_selects):
-                # Fast path: the raw body already holds the keyword.
-                if _body_contains(row, keyword_bytes):
+            with closing(_iter_query_pages(db_path, fallback_selects)) as rows:
+                for row in rows:
+                    # Fast path: the raw body already holds the keyword.
+                    if _body_contains(row, keyword_bytes):
+                        if append_if_match(db_path, row):
+                            fallback_matches += 1
+                            if fallback_matches >= limit:
+                                break
+                        continue
+                    # Slow path: the keyword may only appear in a parsed label
+                    # (a card type, a media kind), never in the stored bytes.
+                    if not _label_could_match(row, keyword_folded):
+                        continue
                     if append_if_match(db_path, row):
                         fallback_matches += 1
                         if fallback_matches >= limit:
                             break
-                    continue
-                # Slow path: the keyword may only appear in a parsed label
-                # (a card type, a media kind), never in the stored bytes.
-                if not _label_could_match(row, keyword_folded):
-                    continue
-                if append_if_match(db_path, row):
-                    fallback_matches += 1
-                    if fallback_matches >= limit:
-                        break
     hits.sort(key=lambda x: x["_ts"], reverse=True)
     hits = hits[:limit]
     return {"keyword": keyword, "count": len(hits), "messages": hits}
 
 
+@contacts.query_snapshot
 def recent(days: int = 3, limit: int = 100) -> dict:
     _validate_window(days, limit)
     name2id = db.get_name2id()
@@ -259,6 +266,7 @@ def recent(days: int = 3, limit: int = 100) -> dict:
     return {"days": days, "total": len(messages), "conversations": convs}
 
 
+@contacts.query_snapshot
 def summary(days: int = 3) -> dict:
     _validate_window(days)
     name2id = db.get_name2id()
@@ -290,6 +298,7 @@ def summary(days: int = 3) -> dict:
     return {"days": days, "today": datetime.now().strftime("%Y-%m-%d %A"), "conversations": convs}
 
 
+@contacts.query_snapshot
 def system_events(event: str = "", days: int = 30, limit: int = 100) -> dict:
     _validate_window(days, limit)
     from collections import Counter
@@ -349,6 +358,7 @@ def system_events(event: str = "", days: int = 30, limit: int = 100) -> dict:
     }
 
 
+@contacts.query_snapshot
 def stats(days: int = 30) -> dict:
     _validate_window(days)
     from collections import Counter
